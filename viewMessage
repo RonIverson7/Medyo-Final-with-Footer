@@ -315,17 +315,12 @@ const ViewMessageScreen = () => {
     }
 
     const animateKeyboard = (toValue) => {
-      keyboardHeight.stopAnimation();
       Animated.timing(keyboardHeight, {
         toValue,
-        duration: 220,
-        easing: Easing.out(Easing.quad),
+        duration: 150,
+        easing: Easing.inOut(Easing.ease),
         useNativeDriver: false,
-      }).start(({ finished }) => {
-        if (finished) {
-          keyboardHeight.setValue(toValue);
-        }
-      });
+      }).start();
     };
 
     const showSub = Keyboard.addListener('keyboardDidShow', (e) => {
@@ -475,7 +470,7 @@ const ViewMessageScreen = () => {
             scrollEnabled={true}
             nestedScrollEnabled={true}
             decelerationRate="normal"
-            scrollEventThrottle={8}
+            scrollEventThrottle={16}
             bounces={true}
             refreshControl={
               <RefreshControl
@@ -502,12 +497,12 @@ const ViewMessageScreen = () => {
             initialNumToRender={20}
             maxToRenderPerBatch={10}
             windowSize={7}
-            removeClippedSubviews={false}
+            removeClippedSubviews={true}
             showsVerticalScrollIndicator
             scrollEnabled={true}
             nestedScrollEnabled={true}
             decelerationRate="normal"
-            scrollEventThrottle={8}
+            scrollEventThrottle={16}
             bounces={true}
             ListHeaderComponent={
               <View>
