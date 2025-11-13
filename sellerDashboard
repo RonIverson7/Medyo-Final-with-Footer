@@ -1,18 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import {  StyleSheet,View,Text,SafeAreaView,TouchableOpacity,ScrollView,ActivityIndicator,RefreshControl,Modal,TextInput,Image,Alert,KeyboardAvoidingView,Platform,BackHandler} from 'react-native';
+import {  StyleSheet,View,Text,SafeAreaView,TouchableOpacity,ScrollView,ActivityIndicator,RefreshControl,Modal,TextInput,Image,Alert,StatusBar,KeyboardAvoidingView,Platform,BackHandler} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { useUser } from '../contexts/UserContext';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { supabase } from '../../supabase/supabaseClient';
 import { useFocusEffect } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
-import Header from '../components/Header';
-
 const API_BASE = "http://192.168.18.22:3000/api";
 
 export default function SellerDashboardScreen() {
   const router = useRouter();
   const { userData } = useUser();
+  const insets = useSafeAreaInsets();
 
   const [activeTab, setActiveTab] = useState('overview');
   const [selectedPeriod, setSelectedPeriod] = useState('weekly');
@@ -39,6 +39,29 @@ export default function SellerDashboardScreen() {
     completed: 0,
     cancelled: 0
   });
+
+  // Returns state
+  const [returns, setReturns] = useState([]);
+  const [returnsLoading, setReturnsLoading] = useState(false);
+  const [returnFilter, setReturnFilter] = useState('all');
+  const [showAllReturns, setShowAllReturns] = useState(false);
+  const [returnStats, setReturnStats] = useState({
+    totalReturns: 0,
+    pending: 0,
+    approved: 0,
+    rejected: 0,
+    completed: 0
+  });
+  
+  // Return details modal state
+  const [returnDetailsModal, setReturnDetailsModal] = useState(false);
+  const [selectedReturn, setSelectedReturn] = useState(null);
+  const [returnDetails, setReturnDetails] = useState(null);
+  const [returnDetailsLoading, setReturnDetailsLoading] = useState(false);
+  
+  // Message/conversation state
+  const [newMessage, setNewMessage] = useState('');
+  const [sendingMessage, setSendingMessage] = useState(false);
 
   // Stats state
   const [stats, setStats] = useState({
@@ -359,6 +382,73 @@ export default function SellerDashboardScreen() {
     }
   };
 
+  // Fetch returns - Using web-compatible approach with mobile auth
+  const fetchReturns = async (status = null) => {
+    try {
+      setReturnsLoading(true);
+      
+      // Get auth tokens for mobile
+      const { data: sessionData } = await supabase.auth.getSession();
+      const at = sessionData?.session?.access_token || '';
+      const rt = sessionData?.session?.refresh_token || '';
+      
+      // Use same URL pattern as web version
+      const url = status && status !== 'all'
+        ? `${API_BASE}/returns/seller?status=${encodeURIComponent(status)}`
+        : `${API_BASE}/returns/seller`;
+
+      const response = await fetch(url, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Cookie: `access_token=${at}; refresh_token=${rt}`,
+          'Authorization': `Bearer ${at}`,
+        }
+      });
+
+      // Handle response like web version
+      let result;
+      try {
+        result = await response.json();
+      } catch (jsonError) {
+        console.error('Failed to parse JSON response:', jsonError);
+        throw new Error('Invalid response format from server');
+      }
+
+      if (!response.ok || result.success === false) {
+        throw new Error(result.error || result.message || `Request failed (${response.status})`);
+      }
+
+      // Set returns data
+      setReturns(result.data || []);
+      
+      // Calculate stats from data (like web version)
+      const returnsData = result.data || [];
+      const stats = {
+        totalReturns: returnsData.length,
+        pending: returnsData.filter(r => r.status === 'pending').length,
+        approved: returnsData.filter(r => r.status === 'approved').length,
+        rejected: returnsData.filter(r => r.status === 'rejected').length,
+        completed: returnsData.filter(r => r.status === 'refunded' || r.status === 'completed').length
+      };
+      setReturnStats(stats);
+      
+    } catch (error) {
+      console.error('Failed to load returns:', error);
+      setReturns([]);
+      // Reset stats on error
+      setReturnStats({
+        totalReturns: 0,
+        pending: 0,
+        approved: 0,
+        rejected: 0,
+        completed: 0
+      });
+    } finally {
+      setReturnsLoading(false);
+    }
+  };
+
   // Mark as processing
   const handleMarkAsProcessing = async (order) => {
     Alert.alert(
@@ -450,6 +540,211 @@ export default function SellerDashboardScreen() {
       console.error('Error updating order:', error);
       Alert.alert('Error', 'Failed to update order');
     }
+  };
+
+  // Fetch return details
+  const fetchReturnDetails = async (returnId) => {
+    try {
+      setReturnDetailsLoading(true);
+      
+      // Get auth tokens for mobile
+      const { data: sessionData } = await supabase.auth.getSession();
+      const at = sessionData?.session?.access_token || '';
+      const rt = sessionData?.session?.refresh_token || '';
+      
+      const response = await fetch(`${API_BASE}/returns/${returnId}`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Cookie: `access_token=${at}; refresh_token=${rt}`,
+          'Authorization': `Bearer ${at}`,
+        }
+      });
+
+      let result;
+      try {
+        result = await response.json();
+      } catch (jsonError) {
+        console.error('Failed to parse JSON response:', jsonError);
+        throw new Error('Invalid response format from server');
+      }
+
+      if (!response.ok || result.success === false) {
+        throw new Error(result.error || result.message || 'Failed to fetch return details');
+      }
+
+      setReturnDetails(result.data);
+    } catch (error) {
+      console.error('Error fetching return details:', error);
+      Alert.alert('Error', error.message || 'Failed to load return details');
+    } finally {
+      setReturnDetailsLoading(false);
+    }
+  };
+
+  // Handle view return details
+  const handleViewReturnDetails = (returnRequest) => {
+    setSelectedReturn(returnRequest);
+    setReturnDetailsModal(true);
+    setNewMessage(''); // Reset message input
+    fetchReturnDetails(returnRequest.returnId);
+  };
+
+  // Send message in return conversation
+  const handleSendMessage = async () => {
+    if (!newMessage.trim() || !selectedReturn) {
+      return;
+    }
+
+    try {
+      setSendingMessage(true);
+      
+      // Get auth tokens for mobile
+      const { data: sessionData } = await supabase.auth.getSession();
+      const at = sessionData?.session?.access_token || '';
+      const rt = sessionData?.session?.refresh_token || '';
+      
+      const response = await fetch(`${API_BASE}/returns/${selectedReturn.returnId}/messages`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Cookie: `access_token=${at}; refresh_token=${rt}`,
+          'Authorization': `Bearer ${at}`,
+        },
+        body: JSON.stringify({
+          message: newMessage.trim()
+        })
+      });
+
+      let result;
+      try {
+        result = await response.json();
+      } catch (jsonError) {
+        throw new Error('Invalid response format from server');
+      }
+
+      if (!response.ok || result.success === false) {
+        throw new Error(result.error || result.message || 'Failed to send message');
+      }
+
+      // Clear message input and refresh details
+      setNewMessage('');
+      await fetchReturnDetails(selectedReturn.returnId);
+      
+    } catch (error) {
+      console.error('Error sending message:', error);
+      Alert.alert('Error', error.message || 'Failed to send message');
+    } finally {
+      setSendingMessage(false);
+    }
+  };
+
+  // Handle approve return - Using web-compatible API
+  const handleApproveReturn = async (returnRequest) => {
+    Alert.alert(
+      'Approve Return',
+      `Approve return request for "${returnRequest.itemTitle || 'this item'}"? This will initiate the refund process.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Approve',
+          onPress: async () => {
+            try {
+              // Get auth tokens for mobile
+              const { data: sessionData } = await supabase.auth.getSession();
+              const at = sessionData?.session?.access_token || '';
+              const rt = sessionData?.session?.refresh_token || '';
+              
+              const response = await fetch(`${API_BASE}/returns/${returnRequest.returnId}/approve`, {
+                method: 'PUT',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Cookie: `access_token=${at}; refresh_token=${rt}`,
+                  'Authorization': `Bearer ${at}`,
+                },
+                body: JSON.stringify({
+                  sellerResponse: 'Return approved by seller'
+                })
+              });
+
+              let result;
+              try {
+                result = await response.json();
+              } catch (jsonError) {
+                throw new Error('Invalid response format from server');
+              }
+
+              if (!response.ok || result.success === false) {
+                throw new Error(result.error || result.message || 'Failed to approve return');
+              }
+
+              Alert.alert('Success', 'Return request approved!');
+              fetchReturns(returnFilter === 'all' ? null : returnFilter);
+              fetchStats(selectedPeriod);
+            } catch (error) {
+              console.error('Error approving return:', error);
+              Alert.alert('Error', error.message || 'Failed to approve return');
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  // Handle reject return - Using web-compatible API
+  const handleRejectReturn = async (returnRequest) => {
+    Alert.alert(
+      'Reject Return',
+      `Reject return request for "${returnRequest.itemTitle || 'this item'}"? Please provide a reason.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reject',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              // Get auth tokens for mobile
+              const { data: sessionData } = await supabase.auth.getSession();
+              const at = sessionData?.session?.access_token || '';
+              const rt = sessionData?.session?.refresh_token || '';
+              
+              const response = await fetch(`${API_BASE}/returns/${returnRequest.returnId}/reject`, {
+                method: 'PUT',
+                credentials: 'include',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Cookie: `access_token=${at}; refresh_token=${rt}`,
+                  'Authorization': `Bearer ${at}`,
+                },
+                body: JSON.stringify({
+                  sellerResponse: 'Seller rejected the return request'
+                })
+              });
+
+              let result;
+              try {
+                result = await response.json();
+              } catch (jsonError) {
+                throw new Error('Invalid response format from server');
+              }
+
+              if (!response.ok || result.success === false) {
+                throw new Error(result.error || result.message || 'Failed to reject return');
+              }
+
+              Alert.alert('Success', 'Return request rejected!');
+              fetchReturns(returnFilter === 'all' ? null : returnFilter);
+              fetchStats(selectedPeriod);
+            } catch (error) {
+              console.error('Error rejecting return:', error);
+              Alert.alert('Error', error.message || 'Failed to reject return');
+            }
+          }
+        }
+      ]
+    );
   };
 
   // Delete product
@@ -824,10 +1119,17 @@ export default function SellerDashboardScreen() {
         fetchProducts(),
         fetchPayoutBalance(),
         fetchPaymentMethod(),
-        activeTab === 'orders' ? fetchOrders(orderFilter === 'all' ? null : orderFilter) : Promise.resolve()
+        activeTab === 'orders' ? fetchOrders(orderFilter === 'all' ? null : orderFilter) : Promise.resolve(),
+        activeTab === 'returns' ? fetchReturns(returnFilter === 'all' ? null : returnFilter) : Promise.resolve()
       ]).finally(() => setLoading(false));
     }
-  }, [userData, selectedPeriod, activeTab, orderFilter]);
+  }, [userData, selectedPeriod, activeTab, orderFilter, returnFilter]);
+
+  useFocusEffect(
+    useCallback(() => {
+      setActiveTab('overview');
+    }, [])
+  );
 
   // Refresh on focus
   useFocusEffect(
@@ -840,8 +1142,11 @@ export default function SellerDashboardScreen() {
         if (activeTab === 'orders') {
           fetchOrders(orderFilter === 'all' ? null : orderFilter);
         }
+        if (activeTab === 'returns') {
+          fetchReturns(returnFilter === 'all' ? null : returnFilter);
+        }
       }
-    }, [userData, selectedPeriod, activeTab, orderFilter])
+    }, [userData, selectedPeriod, activeTab, orderFilter, returnFilter])
   );
 
   // Pull to refresh
@@ -852,28 +1157,37 @@ export default function SellerDashboardScreen() {
       fetchProducts(),
       fetchPayoutBalance(),
       fetchPaymentMethod(),
-      activeTab === 'orders' ? fetchOrders(orderFilter === 'all' ? null : orderFilter) : Promise.resolve()
+      activeTab === 'orders' ? fetchOrders(orderFilter === 'all' ? null : orderFilter) : Promise.resolve(),
+      activeTab === 'returns' ? fetchReturns(returnFilter === 'all' ? null : returnFilter) : Promise.resolve()
     ]).finally(() => setRefreshing(false));
-  }, [selectedPeriod, activeTab, orderFilter]);
+  }, [selectedPeriod, activeTab, orderFilter, returnFilter]);
 
   // Check if user is seller
   if (!userData?.isSeller) {
-    return (
+    useFocusEffect(
+    useCallback(() => {
+      const onBack = () => {
+        try { router.replace('/(drawer)/marketplace'); } catch {}
+        return true;
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+      return () => { try { sub.remove(); } catch {} };
+    }, [router])
+  );
+
+  return (
       <SafeAreaView style={styles.safeArea}>
-        <Header title="Seller Dashboard" showSearch={false} />
-        
-        {/* Back Button for iOS */}
-        <View style={styles.backButtonContainer}>
-          <TouchableOpacity 
-            style={styles.backButton}
-            onPress={() => router.push('/(drawer)/marketplace')}
-            activeOpacity={0.7}
-          >
-            <Ionicons name="arrow-back" size={24} color="#A68C7B" />
-            <Text style={styles.backButtonText}>Back to Marketplace</Text>
-          </TouchableOpacity>
+        <View style={[styles.header, { paddingTop: insets.top, height: insets.top + 56 }]}>
+          <View style={styles.headerLeft}>
+            <TouchableOpacity 
+              style={styles.backButton}
+              onPress={() => router.replace('/(drawer)/marketplace')}
+            >
+              <Ionicons name="arrow-back" size={24} color="#333" />
+            </TouchableOpacity>
+            <Text style={styles.headerTitle}>Seller Dashboard</Text>
+          </View>
         </View>
-        
         <View style={styles.notSellerContainer}>
           <Ionicons name="storefront-outline" size={80} color="#ccc" />
           <Text style={styles.notSellerTitle}>Not a Seller Yet</Text>
@@ -891,35 +1205,31 @@ export default function SellerDashboardScreen() {
     );
   }
 
-  // Android hardware back button handler
+  // Ensure hardware back navigates to marketplace on Seller Dashboard
   useFocusEffect(
     useCallback(() => {
-      if (Platform.OS !== 'android') return undefined;
-      
-      const onBackPress = () => {
-        router.push('/(drawer)/marketplace');
-        return true; // Prevent default back behavior
+      const onBack = () => {
+        try { router.replace('/(drawer)/marketplace'); } catch {}
+        return true;
       };
-
-      const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
-      return () => subscription.remove();
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+      return () => { try { sub.remove(); } catch {} };
     }, [router])
   );
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <Header title="Seller Dashboard" showSearch={false} />
-      
-      {/* Back Button for iOS */}
-      <View style={styles.backButtonContainer}>
-        <TouchableOpacity 
-          style={styles.backButton}
-          onPress={() => router.push('/(drawer)/marketplace')}
-          activeOpacity={0.7}
-        >
-          <Ionicons name="arrow-back" size={24} color="#A68C7B" />
-          <Text style={styles.backButtonText}>Back to Marketplace</Text>
-        </TouchableOpacity>
+      {/* Header */}
+      <View style={[styles.header, { paddingTop: insets.top, height: insets.top + 56 }]}> 
+        <View style={styles.headerLeft}>
+          <TouchableOpacity 
+            style={styles.backButton}
+            onPress={() => router.replace('/(drawer)/marketplace')}
+          >
+            <Ionicons name="arrow-back" size={24} color="#333" />
+          </TouchableOpacity>
+          <Text style={styles.headerTitle}>Seller Dashboard</Text>
+        </View>
       </View>
 
       {loading ? (
@@ -945,8 +1255,10 @@ export default function SellerDashboardScreen() {
               style={[styles.tab, activeTab === 'overview' && styles.tabActive]}
               onPress={() => setActiveTab('overview')}
             >
-              <Ionicons name="grid-outline" size={20} color={activeTab === 'overview' ? '#A68C7B' : '#666'} />
-              <Text style={[styles.tabText, activeTab === 'overview' && styles.tabTextActive]}>
+              <View style={styles.tabIconContainer}>
+                <Ionicons name="grid-outline" size={24} color={activeTab === 'overview' ? '#A68C7B' : '#999'} />
+              </View>
+              <Text style={[styles.tabText, activeTab === 'overview' && styles.tabTextActive]} numberOfLines={2}>
                 Overview
               </Text>
             </TouchableOpacity>
@@ -954,8 +1266,10 @@ export default function SellerDashboardScreen() {
               style={[styles.tab, activeTab === 'products' && styles.tabActive]}
               onPress={() => setActiveTab('products')}
             >
-              <Ionicons name="pricetags-outline" size={20} color={activeTab === 'products' ? '#A68C7B' : '#666'} />
-              <Text style={[styles.tabText, activeTab === 'products' && styles.tabTextActive]}>
+              <View style={styles.tabIconContainer}>
+                <Ionicons name="pricetags-outline" size={24} color={activeTab === 'products' ? '#A68C7B' : '#999'} />
+              </View>
+              <Text style={[styles.tabText, activeTab === 'products' && styles.tabTextActive]} numberOfLines={2}>
                 Products
               </Text>
             </TouchableOpacity>
@@ -963,22 +1277,42 @@ export default function SellerDashboardScreen() {
               style={[styles.tab, activeTab === 'orders' && styles.tabActive]}
               onPress={() => setActiveTab('orders')}
             >
-              <Ionicons name="list-outline" size={20} color={activeTab === 'orders' ? '#A68C7B' : '#666'} />
-              <Text style={[styles.tabText, activeTab === 'orders' && styles.tabTextActive]}>
+              <View style={styles.tabIconContainer}>
+                <Ionicons name="list-outline" size={24} color={activeTab === 'orders' ? '#A68C7B' : '#999'} />
+                {orderStats.toShip > 0 && (
+                  <View style={styles.badge}>
+                    <Text style={styles.badgeText}>{orderStats.toShip}</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={[styles.tabText, activeTab === 'orders' && styles.tabTextActive]} numberOfLines={2}>
                 Orders
               </Text>
-              {orderStats.toShip > 0 && (
-                <View style={styles.badge}>
-                  <Text style={styles.badgeText}>{orderStats.toShip}</Text>
-                </View>
-              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.tab, activeTab === 'returns' && styles.tabActive]}
+              onPress={() => setActiveTab('returns')}
+            >
+              <View style={styles.tabIconContainer}>
+                <Ionicons name="return-up-back-outline" size={24} color={activeTab === 'returns' ? '#A68C7B' : '#999'} />
+                {returnStats.pending > 0 && (
+                  <View style={styles.badge}>
+                    <Text style={styles.badgeText}>{returnStats.pending}</Text>
+                  </View>
+                )}
+              </View>
+              <Text style={[styles.tabText, activeTab === 'returns' && styles.tabTextActive]} numberOfLines={2}>
+                Returns
+              </Text>
             </TouchableOpacity>
             <TouchableOpacity
               style={[styles.tab, activeTab === 'payouts' && styles.tabActive]}
               onPress={() => setActiveTab('payouts')}
             >
-              <Ionicons name="wallet-outline" size={20} color={activeTab === 'payouts' ? '#A68C7B' : '#666'} />
-              <Text style={[styles.tabText, activeTab === 'payouts' && styles.tabTextActive]}>
+              <View style={styles.tabIconContainer}>
+                <Ionicons name="wallet-outline" size={24} color={activeTab === 'payouts' ? '#A68C7B' : '#999'} />
+              </View>
+              <Text style={[styles.tabText, activeTab === 'payouts' && styles.tabTextActive]} numberOfLines={2}>
                 Payouts
               </Text>
             </TouchableOpacity>
@@ -1030,6 +1364,18 @@ export default function SellerDashboardScreen() {
               setShowAllOrders={setShowAllOrders}
             />
           )}
+          {activeTab === 'returns' && (
+            <ReturnsTab 
+              returns={returns} 
+              loading={returnsLoading}
+              returnFilter={returnFilter}
+              setReturnFilter={setReturnFilter}
+              returnStats={returnStats}
+              onViewDetails={handleViewReturnDetails}
+              showAllReturns={showAllReturns}
+              setShowAllReturns={setShowAllReturns}
+            />
+          )}
         </ScrollView>
       )}
 
@@ -1064,6 +1410,7 @@ export default function SellerDashboardScreen() {
 
                 <ScrollView 
                   style={styles.modalBody}
+                  contentContainerStyle={{ paddingBottom: insets.bottom + 3 }}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
                 >
@@ -1152,6 +1499,7 @@ export default function SellerDashboardScreen() {
 
                 <ScrollView 
                   style={styles.modalBody}
+                  contentContainerStyle={{ paddingBottom: insets.bottom + 3 }}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
                 >
@@ -1410,6 +1758,231 @@ export default function SellerDashboardScreen() {
         </Modal>
       )}
 
+      {/* Return Details Modal */}
+      {returnDetailsModal && selectedReturn && (
+        <Modal
+          visible={returnDetailsModal}
+          animationType="slide"
+          transparent={true}
+          onRequestClose={() => {
+            setReturnDetailsModal(false);
+            setSelectedReturn(null);
+            setReturnDetails(null);
+          }}
+        >
+          <View style={styles.modalOverlay}>
+            <KeyboardAvoidingView 
+              style={styles.modalContent}
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              keyboardVerticalOffset={Platform.OS === 'ios' ? 20 : 0}
+            >
+                <View style={styles.modalHeader}>
+                  <Text style={styles.modalTitle}>Return Details</Text>
+                  <TouchableOpacity onPress={() => {
+                    setReturnDetailsModal(false);
+                    setSelectedReturn(null);
+                    setReturnDetails(null);
+                  }}>
+                    <Ionicons name="close" size={24} color="#333" />
+                  </TouchableOpacity>
+                </View>
+
+                <ScrollView 
+                  style={styles.modalBody}
+                  contentContainerStyle={{ paddingBottom: insets.bottom + 3 }}
+                  keyboardShouldPersistTaps="handled"
+                  showsVerticalScrollIndicator={false}
+                >
+                  {returnDetailsLoading ? (
+                    <View style={styles.loadingContainer}>
+                      <ActivityIndicator size="large" color="#A68C7B" />
+                      <Text style={styles.loadingText}>Loading return details...</Text>
+                    </View>
+                  ) : returnDetails ? (
+                    <>
+                      {/* Return Summary */}
+                      <View style={styles.returnSummaryBox}>
+                        <View style={styles.summaryRow}>
+                          <Text style={styles.summaryLabel}>Return ID:</Text>
+                          <Text style={styles.summaryValue}>#{selectedReturn.returnId.slice(0, 8)}</Text>
+                        </View>
+                        <View style={styles.summaryRow}>
+                          <Text style={styles.summaryLabel}>Status:</Text>
+                          <View style={[styles.returnStatusBadge, styles[`returnStatus${selectedReturn.status.charAt(0).toUpperCase() + selectedReturn.status.slice(1)}`]]}>
+                            <Text style={styles.returnStatusText}>
+                              {selectedReturn.status.charAt(0).toUpperCase() + selectedReturn.status.slice(1)}
+                            </Text>
+                          </View>
+                        </View>
+                        <View style={styles.summaryRow}>
+                          <Text style={styles.summaryLabel}>Requested:</Text>
+                          <Text style={styles.summaryValue}>{new Date(selectedReturn.createdAt).toLocaleDateString()}</Text>
+                        </View>
+                        <View style={styles.summaryRow}>
+                          <Text style={styles.summaryLabel}>Refund Amount:</Text>
+                          <Text style={styles.summaryValue}>₱{selectedReturn.refundAmount?.toLocaleString() || '0'}</Text>
+                        </View>
+                      </View>
+
+                      {/* Return Reason */}
+                      <View style={styles.detailSection}>
+                        <Text style={styles.detailSectionTitle}>Return Reason</Text>
+                        <Text style={styles.detailText}>
+                          {selectedReturn.reason?.replaceAll('_', ' ') || 'No reason provided'}
+                        </Text>
+                        {selectedReturn.description && (
+                          <Text style={styles.detailDescription}>{selectedReturn.description}</Text>
+                        )}
+                      </View>
+
+                      {/* Customer Information */}
+                      {returnDetails.customerInfo && (
+                        <View style={styles.detailSection}>
+                          <Text style={styles.detailSectionTitle}>Customer Information</Text>
+                          <Text style={styles.detailText}>Name: {returnDetails.customerInfo.name}</Text>
+                          <Text style={styles.detailText}>Email: {returnDetails.customerInfo.email}</Text>
+                        </View>
+                      )}
+
+                      {/* Order Information */}
+                      {returnDetails.orderInfo && (
+                        <View style={styles.detailSection}>
+                          <Text style={styles.detailSectionTitle}>Order Information</Text>
+                          <Text style={styles.detailText}>Order ID: #{returnDetails.orderInfo.orderId?.slice(0, 8)}</Text>
+                          <Text style={styles.detailText}>Order Date: {new Date(returnDetails.orderInfo.createdAt).toLocaleDateString()}</Text>
+                        </View>
+                      )}
+
+                      {/* Evidence Images */}
+                      {returnDetails.evidence && returnDetails.evidence.length > 0 && (
+                        <View style={styles.detailSection}>
+                          <Text style={styles.detailSectionTitle}>Evidence</Text>
+                          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                            {returnDetails.evidence.map((imageUrl, index) => (
+                              <Image 
+                                key={index}
+                                source={{ uri: imageUrl }}
+                                style={styles.evidenceImage}
+                                resizeMode="cover"
+                              />
+                            ))}
+                          </ScrollView>
+                        </View>
+                      )}
+
+                      {/* Divider */}
+                      <View style={styles.divider} />
+
+                      {/* Conversation */}
+                      <View style={styles.conversationSection}>
+                        <Text style={styles.sectionTitle}>Conversation</Text>
+                        <ScrollView style={styles.conversationContainer} showsVerticalScrollIndicator={true}>
+                          {returnDetails.messages && returnDetails.messages.length > 0 ? (
+                            returnDetails.messages.map((msg, index) => (
+                              <View key={index} style={styles.conversationItem}>
+                                <View style={styles.messageHeader}>
+                                  <Text style={styles.messageDate}>
+                                    {new Date(msg.createdAt).toLocaleDateString('en-US', {
+                                      year: 'numeric',
+                                      month: 'short',
+                                      day: 'numeric',
+                                      hour: '2-digit',
+                                      minute: '2-digit'
+                                    })}
+                                  </Text>
+                                  {msg.isAdmin && (
+                                    <View style={styles.adminBadge}>
+                                      <Text style={styles.adminBadgeText}>Admin</Text>
+                                    </View>
+                                  )}
+                                </View>
+                                <Text style={styles.messageText}>{msg.message}</Text>
+                              </View>
+                            ))
+                          ) : (
+                            <Text style={styles.noMessagesText}>No messages yet.</Text>
+                          )}
+                        </ScrollView>
+
+                        <View style={styles.messageInputRow}>
+                          <TextInput
+                            style={styles.messageInput}
+                            value={newMessage}
+                            onChangeText={setNewMessage}
+                            placeholder="Write a message..."
+                            multiline={false}
+                          />
+                          <TouchableOpacity
+                            style={[
+                              styles.sendButton, 
+                              (!newMessage.trim() || sendingMessage) && styles.sendButtonDisabled
+                            ]}
+                            onPress={handleSendMessage}
+                            disabled={!newMessage.trim() || sendingMessage}
+                          >
+                            {sendingMessage ? (
+                              <ActivityIndicator size="small" color="#fff" />
+                            ) : (
+                              <Text style={styles.sendButtonText}>Send</Text>
+                            )}
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+
+                      {/* Action Buttons for Pending Returns */}
+                      {selectedReturn.status === 'pending' && (
+                        <View style={styles.modalActionsContainer}>
+                          <TouchableOpacity 
+                            style={styles.modalRejectBtn}
+                            onPress={async () => {
+                              setReturnDetailsModal(false);
+                              setSelectedReturn(null);
+                              setReturnDetails(null);
+                              setNewMessage('');
+                              await handleRejectReturn(selectedReturn);
+                            }}
+                          >
+                            <Text style={styles.modalRejectBtnText}>Reject Return</Text>
+                          </TouchableOpacity>
+                          <TouchableOpacity 
+                            style={styles.modalApproveBtn}
+                            onPress={async () => {
+                              setReturnDetailsModal(false);
+                              setSelectedReturn(null);
+                              setReturnDetails(null);
+                              setNewMessage('');
+                              await handleApproveReturn(selectedReturn);
+                            }}
+                          >
+                            <Text style={styles.modalApproveBtnText}>Approve Return</Text>
+                          </TouchableOpacity>
+                        </View>
+                      )}
+                    </>
+                  ) : (
+                    <View style={styles.errorContainer}>
+                      <Text style={styles.errorText}>Failed to load return details</Text>
+                    </View>
+                  )}
+                  
+                  {/* Modal Footer */}
+                  <View style={styles.modalFooter}>
+                    <View style={styles.footerContent}>
+                      <Ionicons name="information-circle" size={20} color="#FF9800" />
+                      <Text style={styles.footerText}>
+                        If you have any questions about this return, please contact our customer support.
+                      </Text>
+                    </View>
+                  </View>
+                  
+                  {/* Bottom Spacer */}
+                  <View style={styles.bottomSpacer} />
+                </ScrollView>
+            </KeyboardAvoidingView>
+          </View>
+        </Modal>
+      )}
+
       {/* Add Product Modal */}
       {addProductModal && (
         <Modal
@@ -1441,6 +2014,7 @@ export default function SellerDashboardScreen() {
 
                 <ScrollView 
                   style={styles.modalBody}
+                  contentContainerStyle={{ paddingBottom: insets.bottom + 12 }}
                   keyboardShouldPersistTaps="handled"
                   showsVerticalScrollIndicator={false}
                 >
@@ -1996,20 +2570,20 @@ const ProductsTab = ({ products, loading, router, onDelete, onEdit, showAllProdu
 
   return (
     <View style={styles.productsContainer}>
-      {/* Add Product Button */}
-      <TouchableOpacity 
-        style={styles.addProductBtn}
-        onPress={onAddProduct}
-      >
-        <Ionicons name="add-circle-outline" size={24} color="#fff" />
-        <Text style={styles.addProductBtnText}>Add Product</Text>
-      </TouchableOpacity>
+      {/* Header with My Product text and Add Product button */}
+      <View style={styles.productsHeader}>
+        <Text style={styles.myProductTitle}>My Product</Text>
+        <TouchableOpacity 
+          style={styles.addProductBtnHeader}
+          onPress={onAddProduct}
+        >
+          <Ionicons name="add-circle-outline" size={20} color="#A68C7B" />
+          <Text style={styles.addProductBtnHeaderText}>Add Product</Text>
+        </TouchableOpacity>
+      </View>
 
       {/* Divider */}
       <View style={styles.sectionDivider} />
-
-      {/* Products List */}
-      <Text style={styles.productsListTitle}>Product Inventory</Text>
 
       {displayedProducts.map(product => (
         <View key={product.marketItemId} style={styles.productCard}>
@@ -2296,32 +2870,205 @@ const OrdersTab = ({ orders, loading, orderFilter, setOrderFilter, orderStats, o
   );
 };
 
+// Returns Tab Component
+const ReturnsTab = ({ returns, loading, returnFilter, setReturnFilter, returnStats, onViewDetails, showAllReturns, setShowAllReturns }) => {
+  const formatDate = (dateString) => {
+    const date = new Date(dateString);
+    return date.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    });
+  };
+
+  return (
+    <View style={styles.returnsContainer}>
+      {/* Filter Tabs */}
+      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterContainer}>
+        <TouchableOpacity
+          style={[styles.filterBtn, returnFilter === 'all' && styles.filterBtnActive]}
+          onPress={() => setReturnFilter('all')}
+        >
+          <Text style={[styles.filterText, returnFilter === 'all' && styles.filterTextActive]}>
+            All ({returnStats.totalReturns})
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.filterBtn, returnFilter === 'pending' && styles.filterBtnActive]}
+          onPress={() => setReturnFilter('pending')}
+        >
+          <Text style={[styles.filterText, returnFilter === 'pending' && styles.filterTextActive]}>
+            Pending ({returnStats.pending})
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.filterBtn, returnFilter === 'approved' && styles.filterBtnActive]}
+          onPress={() => setReturnFilter('approved')}
+        >
+          <Text style={[styles.filterText, returnFilter === 'approved' && styles.filterTextActive]}>
+            Approved ({returnStats.approved})
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.filterBtn, returnFilter === 'rejected' && styles.filterBtnActive]}
+          onPress={() => setReturnFilter('rejected')}
+        >
+          <Text style={[styles.filterText, returnFilter === 'rejected' && styles.filterTextActive]}>
+            Rejected ({returnStats.rejected})
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.filterBtn, returnFilter === 'refunded' && styles.filterBtnActive]}
+          onPress={() => setReturnFilter('refunded')}
+        >
+          <Text style={[styles.filterText, returnFilter === 'refunded' && styles.filterTextActive]}>
+            Refunded ({returnStats.completed})
+          </Text>
+        </TouchableOpacity>
+      </ScrollView>
+
+      {/* Returns List */}
+      {loading ? (
+        <View style={styles.loadingContainer}>
+          <ActivityIndicator size="large" color="#A68C7B" />
+        </View>
+      ) : returns.length === 0 ? (
+        <View style={styles.emptyContainer}>
+          <Ionicons name="return-up-back-outline" size={80} color="#ccc" />
+          <Text style={styles.emptyTitle}>No Returns Found</Text>
+          <Text style={styles.emptyText}>Return requests will appear here</Text>
+        </View>
+      ) : (
+        <>
+        {(showAllReturns ? returns : returns.slice(0, 6)).map(returnRequest => (
+          <View key={returnRequest.returnId} style={styles.returnCard}>
+            <View style={styles.returnHeader}>
+              <View style={styles.returnHeaderLeft}>
+                <Text style={styles.returnId}>Return #{returnRequest.returnId.slice(0, 8)}</Text>
+                <View style={[styles.returnStatusBadge, styles[`returnStatus${returnRequest.status.charAt(0).toUpperCase() + returnRequest.status.slice(1)}`]]}>
+                  <Text style={styles.returnStatusText}>
+                    {returnRequest.status.charAt(0).toUpperCase() + returnRequest.status.slice(1)}
+                  </Text>
+                </View>
+              </View>
+              <Text style={styles.returnAmount}>₱{returnRequest.refundAmount?.toLocaleString() || '0'}</Text>
+            </View>
+            <Text style={styles.returnDate}>Requested: {formatDate(returnRequest.createdAt)}</Text>
+            
+            {/* Return Reason and Description */}
+            <View style={styles.returnReasonContainer}>
+              <Text style={styles.returnReason}>
+                Reason: {returnRequest.reason?.replaceAll('_', ' ') || 'No reason provided'}
+              </Text>
+              {returnRequest.description && (
+                <Text style={styles.returnDescription} numberOfLines={2}>
+                  {returnRequest.description}
+                </Text>
+              )}
+            </View>
+
+            {/* View Details Button */}
+            <View style={styles.returnActionsContainer}>
+              <TouchableOpacity 
+                style={styles.viewDetailsBtn}
+                onPress={() => onViewDetails(returnRequest)}
+              >
+                <Ionicons name="eye-outline" size={16} color="#A68C7B" />
+                <Text style={styles.viewDetailsBtnText}>View Details</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Status Messages */}
+            {returnRequest.status === 'approved' && (
+              <View style={styles.approvedContainer}>
+                <Ionicons name="checkmark-circle" size={20} color="#4CAF50" />
+                <Text style={styles.approvedText}>Approved - Refund Processing</Text>
+              </View>
+            )}
+
+            {returnRequest.status === 'rejected' && (
+              <View style={styles.rejectedContainer}>
+                <Ionicons name="close-circle" size={20} color="#F44336" />
+                <Text style={styles.rejectedText}>Rejected</Text>
+                {returnRequest.sellerResponse && (
+                  <Text style={styles.rejectionReason}>Response: {returnRequest.sellerResponse}</Text>
+                )}
+              </View>
+            )}
+
+            {returnRequest.status === 'refunded' && (
+              <View style={styles.completedContainer}>
+                <Ionicons name="checkmark-circle" size={20} color="#4CAF50" />
+                <Text style={styles.completedText}>Refunded - Process Complete</Text>
+              </View>
+            )}
+
+            {returnRequest.status === 'disputed' && (
+              <View style={styles.disputedContainer}>
+                <Ionicons name="warning" size={20} color="#FF9800" />
+                <Text style={styles.disputedText}>Disputed - Under Review</Text>
+              </View>
+            )}
+          </View>
+        ))}
+
+        {/* Load More/Less Button */}
+        {returns.length > 6 && (
+          <TouchableOpacity 
+            style={styles.loadMoreBtn}
+            onPress={() => setShowAllReturns(!showAllReturns)}
+          >
+            <Text style={styles.loadMoreText}>
+              {showAllReturns ? 'Show Less' : `Load More (${returns.length - 6} more)`}
+            </Text>
+            <Ionicons 
+              name={showAllReturns ? "chevron-up" : "chevron-down"} 
+              size={20} 
+              color="#A68C7B" 
+            />
+          </TouchableOpacity>
+        )}
+        </>
+      )}
+    </View>
+  );
+};
+
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
     backgroundColor: '#fff',
   },
-  backButtonContainer: {
-    backgroundColor: '#fff',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  backButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 8,
-  },
-  backButtonText: {
-    fontSize: 16,
-    color: '#A68C7B',
-    marginLeft: 8,
-    fontWeight: '500',
-  },
   container: {
     flex: 1,
     backgroundColor: '#f5f5f5',
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 14,
+    backgroundColor: '#fff',
+    height: 60,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e8e8e8',
+  },
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  backButton: {
+    padding: 12,
+    minWidth: 56,
+    minHeight: 56,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+    marginLeft: 8,
   },
   loadingContainer: {
     flex: 1,
@@ -2461,33 +3208,47 @@ const styles = StyleSheet.create({
   // Tabs
   tabsContainer: {
     flexDirection: 'row',
-    backgroundColor: '#fff',
+    backgroundColor: '#f8f8f8',
     marginTop: 16,
     marginHorizontal: 16,
-    borderRadius: 12,
-    padding: 4,
+    borderRadius: 16,
+    padding: 8,
     shadowColor: '#000',
     shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.1,
-    shadowRadius: 2,
+    shadowOpacity: 0.05,
+    shadowRadius: 3,
     elevation: 2,
   },
   tab: {
     flex: 1,
-    flexDirection: 'row',
+    flexDirection: 'column',
     alignItems: 'center',
     justifyContent: 'center',
     paddingVertical: 12,
-    borderRadius: 8,
-    gap: 6,
+    paddingHorizontal: 4,
+    borderRadius: 12,
+    minHeight: 75,
   },
   tabActive: {
-    backgroundColor: '#FFF5EB',
+    backgroundColor: '#fff',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  tabIconContainer: {
+    position: 'relative',
+    marginBottom: 6,
   },
   tabText: {
-    fontSize: 13,
-    color: '#666',
+    fontSize: 9,
+    color: '#999',
     fontWeight: '500',
+    textAlign: 'center',
+    lineHeight: 13,
+    width: 45,
+    flexWrap: 'wrap',
   },
   tabTextActive: {
     color: '#A68C7B',
@@ -2495,18 +3256,20 @@ const styles = StyleSheet.create({
   },
   badge: {
     position: 'absolute',
-    top: 8,
-    right: 8,
+    top: -6,
+    right: -8,
     backgroundColor: '#F44336',
     borderRadius: 10,
-    minWidth: 20,
-    height: 20,
+    minWidth: 18,
+    height: 18,
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: 2,
+    borderColor: '#fff',
   },
   badgeText: {
     color: '#fff',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: 'bold',
   },
   // Overview Tab
@@ -3030,18 +3793,21 @@ const styles = StyleSheet.create({
   // Modal
   modalOverlay: {
     flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'flex-end',
   },
   modalOverlayTouchable: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'flex-end',
+    width: '100%',
   },
   modalContent: {
     backgroundColor: '#fff',
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
-    maxHeight: '80%',
+    maxHeight: '85%',
+    minHeight: '70%',
+    width: '100%',
   },
   modalHeader: {
     flexDirection: 'row',
@@ -3057,8 +3823,8 @@ const styles = StyleSheet.create({
     color: '#333',
   },
   modalBody: {
+    flex: 1,
     padding: 20,
-    paddingBottom: 100,
   },
   orderInfo: {
     fontSize: 16,
@@ -3205,7 +3971,6 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
     marginTop: 20,
-    marginBottom: 100,
   },
   submitBtnDisabled: {
     backgroundColor: '#ccc',
@@ -3482,5 +4247,420 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#666',
     lineHeight: 18,
+  },
+  // Products Header Styles
+  productsHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    backgroundColor: '#fff',
+  },
+  myProductTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#A68C7B',
+  },
+  addProductBtnHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF5EB',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#A68C7B',
+  },
+  addProductBtnHeaderText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#A68C7B',
+    marginLeft: 6,
+  },
+  // Returns Tab Styles
+  returnsContainer: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+    paddingHorizontal: 16,
+  },
+  returnCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  returnHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    marginBottom: 8,
+  },
+  returnHeaderLeft: {
+    flex: 1,
+  },
+  returnId: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#333',
+    marginBottom: 6,
+  },
+  returnStatusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    alignSelf: 'flex-start',
+  },
+  returnStatusText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  returnStatusPending: {
+    backgroundColor: '#FF9800',
+  },
+  returnStatusApproved: {
+    backgroundColor: '#4CAF50',
+  },
+  returnStatusRejected: {
+    backgroundColor: '#F44336',
+  },
+  returnStatusCompleted: {
+    backgroundColor: '#2196F3',
+  },
+  returnStatusRefunded: {
+    backgroundColor: '#2196F3',
+  },
+  returnStatusDisputed: {
+    backgroundColor: '#FF9800',
+  },
+  returnAmount: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#A68C7B',
+  },
+  returnDate: {
+    fontSize: 13,
+    color: '#666',
+    marginBottom: 12,
+  },
+  returnItemContainer: {
+    flexDirection: 'row',
+    marginBottom: 12,
+    backgroundColor: '#f9f9f9',
+    borderRadius: 8,
+    padding: 12,
+  },
+  returnItemImage: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  returnItemDetails: {
+    flex: 1,
+  },
+  returnItemTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 4,
+  },
+  returnItemQty: {
+    fontSize: 13,
+    color: '#666',
+    marginBottom: 4,
+  },
+  returnReasonContainer: {
+    backgroundColor: '#f9f9f9',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 12,
+  },
+  returnReason: {
+    fontSize: 13,
+    color: '#333',
+    fontWeight: '500',
+    marginBottom: 4,
+  },
+  returnDescription: {
+    fontSize: 12,
+    color: '#666',
+    fontStyle: 'italic',
+  },
+  customerInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  customerText: {
+    fontSize: 13,
+    color: '#666',
+    marginLeft: 6,
+  },
+  returnActionsContainer: {
+    marginTop: 8,
+  },
+  viewDetailsBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#A68C7B',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    width: '100%',
+  },
+  viewDetailsBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  approvedContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F1F8E9',
+    padding: 10,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  approvedText: {
+    fontSize: 14,
+    color: '#4CAF50',
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+  rejectedContainer: {
+    backgroundColor: '#FFEBEE',
+    padding: 10,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  rejectedText: {
+    fontSize: 14,
+    color: '#F44336',
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  rejectionReason: {
+    fontSize: 12,
+    color: '#666',
+    fontStyle: 'italic',
+  },
+  disputedContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FFF8E1',
+    padding: 10,
+    borderRadius: 8,
+    marginTop: 8,
+  },
+  disputedText: {
+    fontSize: 14,
+    color: '#FF9800',
+    fontWeight: '600',
+    marginLeft: 8,
+  },
+  // Return Details Modal Styles
+  returnSummaryBox: {
+    backgroundColor: '#f9f9f9',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+  },
+  detailSection: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#e8e8e8',
+  },
+  detailSectionTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#A68C7B',
+    marginBottom: 8,
+  },
+  detailText: {
+    fontSize: 14,
+    color: '#333',
+    marginBottom: 4,
+  },
+  detailDescription: {
+    fontSize: 13,
+    color: '#666',
+    fontStyle: 'italic',
+    marginTop: 8,
+  },
+  evidenceImage: {
+    width: 100,
+    height: 100,
+    borderRadius: 8,
+    marginRight: 12,
+  },
+  // Conversation Section Styles (matching ReturnDetailsModal exactly)
+  conversationSection: {
+    marginBottom: 20,
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 12,
+  },
+  conversationContainer: {
+    backgroundColor: '#f9f9f9',
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 16,
+    maxHeight: 200,
+    minHeight: 120,
+  },
+  conversationItem: {
+    marginBottom: 12,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#e0e0e0',
+  },
+  divider: {
+    height: 1,
+    backgroundColor: '#e0e0e0',
+    marginVertical: 20,
+  },
+  messageHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  messageDate: {
+    fontSize: 12,
+    color: '#999',
+  },
+  adminBadge: {
+    backgroundColor: '#2196F3',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 12,
+  },
+  adminBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: '600',
+  },
+  messageText: {
+    fontSize: 14,
+    color: '#333',
+    lineHeight: 20,
+  },
+  noMessagesText: {
+    fontSize: 14,
+    color: '#666',
+    fontStyle: 'italic',
+    textAlign: 'center',
+  },
+  messageInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  messageInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    color: '#333',
+    height: 40,
+  },
+  sendButton: {
+    backgroundColor: '#A68C7B',
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendButtonDisabled: {
+    backgroundColor: '#ccc',
+  },
+  sendButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalActionsContainer: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+  },
+  modalRejectBtn: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#FFF5F5',
+    paddingVertical: 12,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#F44336',
+  },
+  modalRejectBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#F44336',
+  },
+  modalApproveBtn: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#4CAF50',
+    paddingVertical: 12,
+    borderRadius: 8,
+  },
+  modalApproveBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#fff',
+  },
+  errorContainer: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 32,
+  },
+  errorText: {
+    fontSize: 16,
+    color: '#F44336',
+    textAlign: 'center',
+  },
+  // Modal Footer Styles
+  modalFooter: {
+    marginTop: 20,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: '#e0e0e0',
+  },
+  footerContent: {
+    flexDirection: 'row',
+    backgroundColor: '#FFF8E1',
+    padding: 16,
+    borderRadius: 8,
+    alignItems: 'flex-start',
+  },
+  footerText: {
+    fontSize: 14,
+    color: '#F57C00',
+    marginLeft: 12,
+    flex: 1,
+    lineHeight: 20,
+  },
+  bottomSpacer: {
+    height: 30,
   },
 });
