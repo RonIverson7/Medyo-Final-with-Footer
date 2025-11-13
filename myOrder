@@ -1,30 +1,18 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { 
-  StyleSheet, 
-  View, 
-  Text, 
-  SafeAreaView, 
-  TouchableOpacity, 
-  ScrollView, 
-  ActivityIndicator, 
-  RefreshControl,
-  Modal,
-  Image,
-  Alert,
-  Linking,
-  BackHandler,
-  Platform
-} from 'react-native';
+import {  StyleSheet,View,Text,SafeAreaView,TouchableOpacity,ScrollView,ActivityIndicator,RefreshControl,Modal,Image,Alert,Linking,StatusBar,BackHandler} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { supabase } from '../../supabase/supabaseClient';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
-import Header from '../components/Header';
+import ReturnRequestModal from '../components/ReturnRequestModal';
+import ReturnDetailsModal from '../components/ReturnDetailsModal';
 
 const API_BASE = "http://192.168.18.22:3000/api";
 
-export default function MyOrdersScreen() {
+function MyOrdersScreen() {
   const router = useRouter();
+  const insets = useSafeAreaInsets();
 
   const [orders, setOrders] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -32,6 +20,13 @@ export default function MyOrdersScreen() {
   const [activeTab, setActiveTab] = useState('all'); // Default to "All"
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [showDetailsModal, setShowDetailsModal] = useState(false);
+  
+  // Return/Refund system states
+  const [buyerReturns, setBuyerReturns] = useState([]);
+  const [showReturnModal, setShowReturnModal] = useState(false);
+  const [returnModalOrder, setReturnModalOrder] = useState(null);
+  const [showReturnDetails, setShowReturnDetails] = useState(false);
+  const [selectedReturnId, setSelectedReturnId] = useState(null);
 
   // Fetch orders
   const fetchOrders = useCallback(async (isRefreshing = false) => {
@@ -42,20 +37,51 @@ export default function MyOrdersScreen() {
     }
 
     try {
-      const { data } = await supabase.auth.getSession();
-      const at = data?.session?.access_token || '';
-      const rt = data?.session?.refresh_token || '';
+      // Get session and tokens for mobile auth
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      
+      if (sessionError) {
+        console.error('❌ Session error:', sessionError);
+        throw new Error('Failed to get session');
+      }
+      
+      if (!data?.session) {
+        console.error('❌ No active session found');
+        throw new Error('No active session - please login');
+      }
+      
+      const at = data.session.access_token;
+      const rt = data.session.refresh_token;
+      
+      if (!at) {
+        console.error('❌ No access token available');
+        throw new Error('No access token - please login again');
+      }
+      
+      console.log('🔑 Using tokens for mobile auth:', {
+        hasAccessToken: !!at,
+        hasRefreshToken: !!rt,
+        tokenLength: at?.length || 0
+      });
 
       const response = await fetch(`${API_BASE}/marketplace/orders/buyer`, {
         method: 'GET',
         credentials: 'include',
         headers: {
-          Cookie: `access_token=${at}; refresh_token=${rt}`,
+          'Content-Type': 'application/json',
+          'Cookie': `access_token=${at}; refresh_token=${rt}`,
           'Authorization': `Bearer ${at}`,
         },
       });
 
       const result = await response.json();
+
+      console.log('📡 API Response:', {
+        status: response.status,
+        ok: response.ok,
+        success: result.success,
+        error: result.error
+      });
 
       if (response.ok && result.success) {
         const orderData = result.data || [];
@@ -68,11 +94,22 @@ export default function MyOrdersScreen() {
           });
         }
         setOrders(orderData);
+        await fetchBuyerReturns();
       } else {
-        console.error('Failed to fetch orders:', result.error);
+        console.error('❌ API Error:', {
+          status: response.status,
+          error: result.error,
+          message: result.message
+        });
+        throw new Error(result.error || result.message || 'Failed to fetch orders');
       }
     } catch (error) {
-      console.error('Error fetching orders:', error);
+      console.error('❌ Failed to fetch orders:', error.message);
+      // If it's an auth error, you might want to redirect to login
+      if (error.message.includes('session') || error.message.includes('token')) {
+        console.warn('🔄 Authentication issue detected');
+        // You could add navigation to login here if needed
+      }
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -139,6 +176,36 @@ export default function MyOrdersScreen() {
     } catch (error) {
       console.error('Error getting payment link:', error);
       Alert.alert('Error', 'Failed to get payment link');
+    }
+  };
+
+  // Check payment status
+  const handleCheckPaymentStatus = async (orderId) => {
+    try {
+      const { data } = await supabase.auth.getSession();
+      const at = data?.session?.access_token || '';
+      const rt = data?.session?.refresh_token || '';
+
+      const response = await fetch(`${API_BASE}/marketplace/orders/${orderId}/check-payment`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          Cookie: `access_token=${at}; refresh_token=${rt}`,
+          'Authorization': `Bearer ${at}`,
+        },
+      });
+
+      const result = await response.json();
+
+      if (response.ok && result.success) {
+        Alert.alert('Payment Confirmed', 'Payment confirmed! Your order has been paid. The seller will process it soon.');
+        fetchOrders(); // Refresh orders list
+      } else {
+        Alert.alert('Payment Not Complete', result.message || 'Payment not yet completed. Please complete payment first.');
+      }
+    } catch (error) {
+      console.error('Error checking payment status:', error);
+      Alert.alert('Error', 'Failed to check payment status. Please try again.');
     }
   };
 
@@ -231,6 +298,77 @@ export default function MyOrdersScreen() {
     );
   };
 
+  // Fetch buyer returns
+  const fetchBuyerReturns = useCallback(async () => {
+    try {
+      // Get session and tokens for mobile auth
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      
+      if (sessionError || !data?.session) {
+        console.warn('⚠️ No valid session for buyer returns');
+        return;
+      }
+      
+      const at = data.session.access_token;
+      const rt = data.session.refresh_token;
+      
+      if (!at) {
+        console.warn('⚠️ No access token for buyer returns');
+        return;
+      }
+
+      const response = await fetch(`${API_BASE}/returns/buyer`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cookie': `access_token=${at}; refresh_token=${rt}`,
+          'Authorization': `Bearer ${at}`,
+        },
+      });
+
+      const result = await response.json();
+      if (response.ok && result.success) {
+        console.log('📦 Buyer returns fetched:', result.data?.length || 0);
+        if (result.data?.length > 0) {
+          console.log('📦 First return sample:', {
+            returnId: result.data[0].returnId?.slice(0, 8),
+            orderId: result.data[0].orderId?.slice(0, 8),
+            status: result.data[0].status
+          });
+        }
+        setBuyerReturns(result.data || []);
+      } else {
+        console.warn('Failed to fetch buyer returns:', result.error);
+      }
+    } catch (error) {
+      console.warn('Failed to load buyer returns:', error);
+    }
+  }, []);
+
+  // Return helper functions
+  const getReturnByOrder = (orderId) => {
+    const found = buyerReturns.find(r => r.orderId === orderId);
+    console.log(`🔍 Looking for return for order ${orderId?.slice(0, 8)}:`, found ? `Found ${found.returnId?.slice(0, 8)} (${found.status})` : 'Not found');
+    return found;
+  };
+  
+  const openReturnModal = (order) => {
+    setReturnModalOrder(order);
+    setShowReturnModal(true);
+  };
+  
+  const openReturnDetails = (returnId) => {
+    setSelectedReturnId(returnId);
+    setShowReturnDetails(true);
+  };
+  
+  const onReturnSubmitted = async () => {
+    // Refresh returns and orders
+    await fetchBuyerReturns();
+    fetchOrders();
+  };
+
   // Calculate order counts
   const getOrderCounts = () => {
     const counts = {
@@ -239,7 +377,8 @@ export default function MyOrdersScreen() {
       paid: 0,
       shipped: 0,
       delivered: 0,
-      cancelled: 0
+      cancelled: 0,
+      refunded: 0
     };
 
     orders.forEach(order => {
@@ -260,6 +399,9 @@ export default function MyOrdersScreen() {
       }
       if (orderStatus === 'cancelled') {
         counts.cancelled++;
+      }
+      if (orderStatus === 'returned' || order.returnStatus === 'approved' || order.returnStatus === 'refunded') {
+        counts.refunded++;
       }
     });
 
@@ -309,6 +451,13 @@ export default function MyOrdersScreen() {
       });
     }
     
+    if (activeTab === 'refunded') {
+      return orders.filter(o => {
+        const orderStatus = o.status?.toLowerCase();
+        return orderStatus === 'returned' || o.returnStatus === 'approved' || o.returnStatus === 'refunded';
+      });
+    }
+    
     return orders;
   };
 
@@ -319,26 +468,38 @@ export default function MyOrdersScreen() {
 
   useEffect(() => {
     fetchOrders();
-  }, [fetchOrders]);
+    fetchBuyerReturns();
+  }, [fetchOrders, fetchBuyerReturns]);
 
   useFocusEffect(
     useCallback(() => {
+      setActiveTab('all');
       fetchOrders();
-    }, [fetchOrders])
+      fetchBuyerReturns();
+    }, [fetchOrders, fetchBuyerReturns])
   );
 
-  // Android hardware back button handler
   useFocusEffect(
     useCallback(() => {
-      if (Platform.OS !== 'android') return undefined;
-      
-      const onBackPress = () => {
-        router.push('/(drawer)/marketplace');
-        return true; // Prevent default back behavior
+      return () => {
+        setShowDetailsModal(false);
+        setShowReturnModal(false);
+        setShowReturnDetails(false);
       };
+    }, [])
+  );
 
-      const subscription = BackHandler.addEventListener('hardwareBackPress', onBackPress);
-      return () => subscription.remove();
+  // Ensure hardware back navigates to marketplace
+  useFocusEffect(
+    useCallback(() => {
+      const onBack = () => {
+        try { router.replace('/(drawer)/marketplace'); } catch {}
+        return true; // consume the event
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+      return () => {
+        try { sub.remove(); } catch {}
+      };
     }, [router])
   );
 
@@ -347,18 +508,20 @@ export default function MyOrdersScreen() {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <Header title="My Orders" showSearch={false} />
       
-      {/* Back Button for iOS */}
-      <View style={styles.backButtonContainer}>
-        <TouchableOpacity 
-          style={styles.backButton}
-          onPress={() => router.push('/(drawer)/marketplace')}
-          activeOpacity={0.7}
-        >
-          <Ionicons name="arrow-back" size={24} color="#A68C7B" />
-          <Text style={styles.backButtonText}>Back to Marketplace</Text>
-        </TouchableOpacity>
+      {/* Custom Header (align with safe area so back button is tappable) */}
+      <View style={[styles.header, { paddingTop: insets.top, height: insets.top + 56 }]}>
+        <View style={styles.headerLeft}>
+          <TouchableOpacity 
+            style={styles.backButton}
+            onPress={() => router.replace('/(drawer)/marketplace')}
+            hitSlop={{ top: 30, bottom: 30, left: 30, right: 30 }}
+            activeOpacity={0.6}
+          >
+            <Ionicons name="arrow-back" size={24} color="#333" />
+          </TouchableOpacity>
+          <Text style={styles.headerTitle}>My Orders</Text>
+        </View>
       </View>
       
       {loading ? (
@@ -410,7 +573,7 @@ export default function MyOrdersScreen() {
               onPress={() => setActiveTab('shipped')}
             >
               <Text style={[styles.tabText, activeTab === 'shipped' && styles.tabTextActive]}>
-                Shipping ({orderCounts.shipped})
+                Shipped ({orderCounts.shipped})
               </Text>
               {activeTab === 'shipped' && <View style={styles.tabIndicator} />}
             </TouchableOpacity>
@@ -420,7 +583,7 @@ export default function MyOrdersScreen() {
               onPress={() => setActiveTab('delivered')}
             >
               <Text style={[styles.tabText, activeTab === 'delivered' && styles.tabTextActive]}>
-                Completed ({orderCounts.delivered})
+                Delivered ({orderCounts.delivered})
               </Text>
               {activeTab === 'delivered' && <View style={styles.tabIndicator} />}
             </TouchableOpacity>
@@ -433,6 +596,16 @@ export default function MyOrdersScreen() {
                 Cancelled ({orderCounts.cancelled})
               </Text>
               {activeTab === 'cancelled' && <View style={styles.tabIndicator} />}
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.tab}
+              onPress={() => setActiveTab('refunded')}
+            >
+              <Text style={[styles.tabText, activeTab === 'refunded' && styles.tabTextActive]}>
+                Refunded ({orderCounts.refunded})
+              </Text>
+              {activeTab === 'refunded' && <View style={styles.tabIndicator} />}
             </TouchableOpacity>
           </ScrollView>
 
@@ -463,8 +636,12 @@ export default function MyOrdersScreen() {
                   order={order}
                   onViewDetails={handleViewDetails}
                   onPayNow={handlePayNow}
+                  onCheckPayment={handleCheckPaymentStatus}
                   onCancel={handleCancelOrder}
                   onMarkDelivered={handleMarkAsDelivered}
+                  onRequestReturn={openReturnModal}
+                  onViewReturn={openReturnDetails}
+                  getReturnByOrder={getReturnByOrder}
                 />
               ))}
             </ScrollView>
@@ -482,12 +659,27 @@ export default function MyOrdersScreen() {
           onMarkDelivered={handleMarkAsDelivered}
         />
       )}
+
+      {/* Return Request Modal */}
+      <ReturnRequestModal
+        visible={showReturnModal}
+        onClose={() => setShowReturnModal(false)}
+        order={returnModalOrder}
+        onReturnSubmitted={onReturnSubmitted}
+      />
+
+      {/* Return Details Modal */}
+      <ReturnDetailsModal
+        visible={showReturnDetails}
+        onClose={() => setShowReturnDetails(false)}
+        returnId={selectedReturnId}
+      />
     </SafeAreaView>
   );
 }
 
 // OrderCard Component
-const OrderCard = ({ order, onViewDetails, onPayNow, onCancel, onMarkDelivered }) => {
+const OrderCard = ({ order, onViewDetails, onPayNow, onCheckPayment, onCancel, onMarkDelivered, onRequestReturn, onViewReturn, getReturnByOrder }) => {
   const getStatusBadge = () => {
     if (order.status === 'cancelled') {
       return { text: 'Cancelled', color: '#F44336' };
@@ -505,7 +697,7 @@ const OrderCard = ({ order, onViewDetails, onPayNow, onCancel, onMarkDelivered }
       return { text: 'Shipping', color: '#A68C7B' };
     }
     if (order.status === 'delivered') {
-      return { text: 'Completed', color: '#4CAF50' };
+      return { text: 'Delivered', color: '#4CAF50' };
     }
     return { text: order.status?.toUpperCase() || 'PENDING', color: '#999' };
   };
@@ -622,21 +814,34 @@ const OrderCard = ({ order, onViewDetails, onPayNow, onCancel, onMarkDelivered }
         </TouchableOpacity>
 
         {order.paymentStatus === 'pending' && order.status !== 'cancelled' && (
-          <>
-            <TouchableOpacity
-              style={styles.actionBtnPrimary}
-              onPress={() => onPayNow(order)}
-            >
-              <Ionicons name="card-outline" size={16} color="#fff" />
-              <Text style={styles.actionBtnPrimaryText}>Pay Now</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.actionBtnDanger}
-              onPress={() => onCancel(order.orderId)}
-            >
-              <Text style={styles.actionBtnDangerText}>Cancel</Text>
-            </TouchableOpacity>
-          </>
+          <View style={styles.pendingPaymentActions}>
+            {/* Primary Action Row */}
+            <View style={styles.primaryActionRow}>
+              <TouchableOpacity
+                style={styles.actionBtnPrimaryExpanded}
+                onPress={() => onPayNow(order)}
+              >
+                <Ionicons name="card-outline" size={16} color="#fff" />
+                <Text style={styles.actionBtnPrimaryText}>Pay Now</Text>
+              </TouchableOpacity>
+            </View>
+            
+            {/* Secondary Actions Row */}
+            <View style={styles.secondaryActionRow}>
+              <TouchableOpacity
+                style={styles.actionBtnInfoCompact}
+                onPress={() => onCheckPayment(order.orderId)}
+              >
+                <Text style={styles.actionBtnInfoTextCompact}>Check Payment</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.actionBtnDangerCompact}
+                onPress={() => onCancel(order.orderId)}
+              >
+                <Text style={styles.actionBtnDangerTextCompact}>Cancel Order</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
         )}
 
         {order.status === 'shipped' && (
@@ -646,6 +851,32 @@ const OrderCard = ({ order, onViewDetails, onPayNow, onCancel, onMarkDelivered }
           >
             <Text style={styles.actionBtnSuccessText}>Mark as Received</Text>
           </TouchableOpacity>
+        )}
+
+        {order.status === 'delivered' && (
+          (() => {
+            const existing = getReturnByOrder(order.orderId);
+            if (existing) {
+              // Show "View Return" for any existing return (pending, approved, rejected, etc.)
+              return (
+                <TouchableOpacity
+                  style={styles.actionBtnWarning}
+                  onPress={() => onViewReturn(existing.returnId)}
+                >
+                  <Text style={styles.actionBtnWarningText}>View Return</Text>
+                </TouchableOpacity>
+              );
+            }
+            // Only show "Request Return" if no return exists yet
+            return (
+              <TouchableOpacity
+                style={styles.actionBtnWarning}
+                onPress={() => onRequestReturn(order)}
+              >
+                <Text style={styles.actionBtnWarningText}>Request Return</Text>
+              </TouchableOpacity>
+            );
+          })()
         )}
       </View>
     </View>
@@ -671,7 +902,7 @@ const OrderDetailsModal = ({ visible, order, onClose, onCancel, onMarkDelivered 
       return { text: 'Shipping', color: '#A68C7B' };
     }
     if (order.status === 'delivered') {
-      return { text: 'Completed', color: '#4CAF50' };
+      return { text: 'Delivered', color: '#4CAF50' };
     }
     return { text: order.status?.toUpperCase() || 'PENDING', color: '#999' };
   };
@@ -850,23 +1081,30 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#fff',
   },
-  backButtonContainer: {
-    backgroundColor: '#fff',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: '#f0f0f0',
-  },
-  backButton: {
+  header: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 8,
+    paddingHorizontal: 15,
+    paddingBottom: 10,
+    backgroundColor: '#fff',
+    height: 60,
   },
-  backButtonText: {
-    fontSize: 16,
-    color: '#A68C7B',
-    marginLeft: 8,
-    fontWeight: '500',
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  backButton: {
+    padding: 10,
+    minWidth: 44,
+    minHeight: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#333',
+    marginLeft: 15,
   },
   loadingContainer: {
     flex: 1,
@@ -1096,26 +1334,25 @@ const styles = StyleSheet.create({
   },
   orderActions: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
     padding: 12,
-    gap: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#f0f0f0',
+    gap: 8,
+    alignItems: 'center',
   },
   actionBtnSecondary: {
     flex: 1,
-    minWidth: '30%',
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-    backgroundColor: '#A68C7B',
+    paddingVertical: 12,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#A68C7B',
     borderRadius: 8,
     alignItems: 'center',
+    marginRight: 4,
   },
   actionBtnSmaller: {
-    flex: 0.8,
+    flex: 1,
   },
   actionBtnSecondaryText: {
-    color: '#fff',
+    color: '#A68C7B',
     fontSize: 14,
     fontWeight: '600',
   },
@@ -1157,7 +1394,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 10,
+    paddingVertical: 12,
     paddingHorizontal: 16,
     backgroundColor: '#4CAF50',
     borderRadius: 8,
@@ -1384,4 +1621,101 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  
+  // New button styles for additional actions
+  actionBtnInfo: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#2196F3',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    gap: 4,
+    minWidth: 80,
+  },
+  actionBtnInfoText: {
+    color: '#2196F3',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  actionBtnWarning: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#A68C7B',
+    paddingVertical: 12,
+    borderRadius: 8,
+    marginLeft: 4,
+  },
+  actionBtnWarningText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  
+  // New styles for reorganized pending payment buttons
+  pendingPaymentActions: {
+    flex: 1,
+    marginLeft: 8,
+    paddingTop: 2,
+  },
+  primaryActionRow: {
+    marginBottom: 8,
+  },
+  actionBtnPrimaryExpanded: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#A68C7B',
+    paddingVertical: 12,
+    borderRadius: 8,
+    gap: 6,
+  },
+  secondaryActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginTop: 4,
+  },
+  actionBtnInfoCompact: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderWidth: 1.5,
+    borderColor: '#2196F3',
+    borderRadius: 8,
+    minHeight: 40,
+  },
+  actionBtnInfoTextCompact: {
+    color: '#2196F3',
+    fontSize: 12,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  actionBtnDangerCompact: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fff',
+    paddingVertical: 10,
+    paddingHorizontal: 8,
+    borderWidth: 1.5,
+    borderColor: '#F44336',
+    borderRadius: 8,
+    minHeight: 40,
+  },
+  actionBtnDangerTextCompact: {
+    color: '#F44336',
+    fontSize: 12,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
 });
+
+export default MyOrdersScreen;
