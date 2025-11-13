@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { StyleSheet, View, Text, SafeAreaView, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator, Image, Modal, KeyboardAvoidingView, Platform, FlatList, RefreshControl, Linking } from 'react-native';
+import { StyleSheet, View, Text, SafeAreaView, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator, Image, Modal, KeyboardAvoidingView, Platform, FlatList, RefreshControl, Linking, BackHandler } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { useRouter } from 'expo-router';
+import { useRouter, useLocalSearchParams } from 'expo-router';
+import { useFocusEffect } from '@react-navigation/native';
 import { supabase } from '../../supabase/supabaseClient';
 import { useUser } from '../contexts/UserContext';
-import Header from '../components/Header';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
 
 const API_BASE = "http://192.168.18.22:3000/api";
 
@@ -13,6 +14,7 @@ const OrderSummaryScreen = () => {
   const router = useRouter();
   const { userData } = useUser();
   const insets = useSafeAreaInsets();
+  const params = useLocalSearchParams();
   
   const [cartItems, setCartItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -27,6 +29,14 @@ const OrderSummaryScreen = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [accessToken, setAccessToken] = useState(null);
   const [refreshToken, setRefreshToken] = useState(null);
+  
+  // P2P Migration: Direct purchase support
+  const isDirectPurchase = params.directPurchase === 'true';
+  const directMarketItemId = params.marketItemId;
+  const directQuantity = parseInt(params.quantity) || 1;
+  
+  console.log('OrderSummary params:', params);
+  console.log('Direct purchase mode:', { isDirectPurchase, directMarketItemId, directQuantity });
   
   // Location data
   const [regions, setRegions] = useState([]);
@@ -104,6 +114,70 @@ const OrderSummaryScreen = () => {
       }
     } catch (error) {
       console.error('Error fetching cart:', error);
+    }
+  };
+
+  // Hardware back: always go back to Marketplace (consistent with My Orders / Seller Dashboard)
+  useFocusEffect(
+    React.useCallback(() => {
+      const onBack = () => {
+        try { router.replace('/(drawer)/marketplace'); } catch {}
+        return true;
+      };
+      const sub = BackHandler.addEventListener('hardwareBackPress', onBack);
+      return () => { try { sub.remove(); } catch {} };
+    }, [router])
+  );
+
+  // P2P Migration: Fetch single marketplace item for direct purchase (matches web version)
+  const fetchDirectPurchaseItem = async (at, rt, marketItemId, quantity) => {
+    console.log('fetchDirectPurchaseItem called with:', { marketItemId, quantity });
+    
+    try {
+      // Use specific item endpoint like web version
+      const response = await fetch(`${API_BASE}/marketplace/items/${marketItemId}`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: { 
+          Cookie: `access_token=${at || ''}; refresh_token=${rt || ''}`,
+          'Authorization': `Bearer ${at || ''}`,
+        },
+      });
+
+      const result = await response.json();
+      console.log('API Response for item:', response.status, result);
+      
+      if (!response.ok || !result.success || !result.data) {
+        throw new Error(result.error || 'Item not found');
+      }
+      
+      const item = result.data;
+      console.log('Fetched specific item:', {
+        marketItemId,
+        title: item.title,
+        price: item.price,
+        seller: item.sellerProfiles?.shopName
+      });
+      
+      // Transform single item to cart format (match web version structure)
+      const cartItem = {
+        id: marketItemId,
+        cartItemId: `direct_${marketItemId}`,
+        quantity: Number(quantity) || 1,
+        marketItemId: marketItemId,
+        title: item.title || 'Unknown Item',
+        price: item.price || 0,
+        primary_image: item.images?.[0] || item.primary_image || null,
+        artist: item.sellerProfiles?.shopName || 'Unknown Artist',
+        sellerProfileId: item.sellerProfileId
+      };
+      
+      console.log('Created cart item:', cartItem);
+      setCartItems([cartItem]);
+    } catch (error) {
+      console.error('Error fetching direct purchase item:', error);
+      Alert.alert('Error', 'Failed to load item details');
+      router.replace('/(drawer)/marketplace');
     }
   };
 
@@ -189,6 +263,10 @@ const OrderSummaryScreen = () => {
 
   useEffect(() => {
     const init = async () => {
+      console.log('OrderSummary useEffect init called');
+      console.log('userData:', userData);
+      console.log('Direct purchase check:', { isDirectPurchase, directMarketItemId, directQuantity });
+      
       if (!userData) {
         Alert.alert('Login Required', 'Please login to checkout');
         router.push('/');
@@ -199,27 +277,50 @@ const OrderSummaryScreen = () => {
         const { data } = await supabase.auth.getSession();
         const at = data?.session?.access_token || null;
         const rt = data?.session?.refresh_token || null;
+        console.log('Session tokens:', { at: !!at, rt: !!rt });
+        
         setAccessToken(at);
         setRefreshToken(rt);
         setLoading(true);
-        await Promise.all([
-          fetchCart(at, rt),
-          fetchAddresses(at, rt),
-        ]);
+        
+        // P2P Migration: Handle direct purchase vs cart-based checkout
+        if (isDirectPurchase && directMarketItemId) {
+          console.log('Direct purchase mode - fetching item:', directMarketItemId);
+          await Promise.all([
+            fetchDirectPurchaseItem(at, rt, directMarketItemId, directQuantity),
+            fetchAddresses(at, rt),
+          ]);
+        } else {
+          console.log('Cart mode - fetching cart');
+          await Promise.all([
+            fetchCart(at, rt),
+            fetchAddresses(at, rt),
+          ]);
+        }
+      } catch (error) {
+        console.error('Error in init:', error);
       } finally {
         setLoading(false);
       }
     };
     init();
-  }, [userData]);
+  }, [userData, isDirectPurchase, directMarketItemId, directQuantity]);
 
   const onRefresh = async () => {
     setRefreshing(true);
     try {
-      await Promise.all([
-        fetchCart(accessToken, refreshToken),
-        fetchAddresses(accessToken, refreshToken),
-      ]);
+      // P2P Migration: Handle direct purchase vs cart-based checkout
+      if (isDirectPurchase && directMarketItemId) {
+        await Promise.all([
+          fetchDirectPurchaseItem(accessToken, refreshToken, directMarketItemId, directQuantity),
+          fetchAddresses(accessToken, refreshToken),
+        ]);
+      } else {
+        await Promise.all([
+          fetchCart(accessToken, refreshToken),
+          fetchAddresses(accessToken, refreshToken),
+        ]);
+      }
     } finally {
       setRefreshing(false);
     }
@@ -319,32 +420,48 @@ const OrderSummaryScreen = () => {
       return;
     }
     
+    if (!cartItems || cartItems.length === 0) {
+      Alert.alert('No items', 'No items found to place order');
+      return;
+    }
+    
     try {
       setLoading(true);
       const address = addresses.find(a => a.userAddressId === selectedAddress);
       
+      // Match web version order data structure exactly
+      const item = cartItems[0]; // For direct purchase, we only have one item
+      const shippingFee = getShippingCost();
+      
       const orderData = {
-        shipping_address: {
+        marketItemId: item.marketItemId,
+        quantity: item.quantity,
+        shippingFee,
+        shippingMethod: selectedShipping,
+        orderNotes: orderNotes || 'None',
+        shippingAddress: {
           fullName: address?.fullName,
           phone: address?.phoneNumber || address?.phone,
-          street: address?.addressLine1 || address?.street,
-          barangay: address?.barangayName || address?.barangay,
-          city: address?.cityMunicipalityName || address?.city,
-          province: address?.provinceName || address?.province,
+          addressLine1: address?.addressLine1 || address?.street,
+          addressLine2: address?.addressLine2 || '',
+          barangayName: address?.barangayName || address?.barangay,
+          cityMunicipalityName: address?.cityMunicipalityName || address?.city,
+          provinceName: address?.provinceName || address?.province,
           postalCode: address?.postalCode,
-          landmark: address?.landmark || '',
+          landmark: address?.landmark || ''
         },
-        contact_info: {
+        contactInfo: {
           name: `${userData?.firstName || ''} ${userData?.lastName || ''}`.trim(),
           email: userData?.email || '',
-          phone: address?.phoneNumber || address?.phone || '',
-        },
-        payment_method: 'xendit', // Xendit handles actual payment method selection
-        shipping_method: selectedShipping,
-        order_notes: orderNotes,
+          phone: address?.phoneNumber || address?.phone || ''
+        }
       };
 
-      const response = await fetch(`${API_BASE}/marketplace/orders/create`, {
+      console.log('Order data being sent:', JSON.stringify(orderData, null, 2));
+      console.log('Cart items:', cartItems);
+      console.log('Is direct purchase:', isDirectPurchase);
+
+      const response = await fetch(`${API_BASE}/marketplace/orders/buy-now`, {
         method: 'POST',
         credentials: 'include',
         headers: {
@@ -355,48 +472,44 @@ const OrderSummaryScreen = () => {
       });
       
       const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result?.error || 'Failed to create order');
+      console.log('API Response:', response.status, result);
+      
+      if (!response.ok || result.success === false) {
+        console.error('Order creation failed:', result);
+        throw new Error(result?.error || result?.message || `Failed to create order (${response.status})`);
       }
       
-      if (result?.success) {
-        const orderId = result?.data?.order?.orderId || result?.data?.order?.orderNumber;
-        const paymentUrl = result?.data?.payment?.paymentUrl;
-        
-        if (paymentUrl) {
-          // Xendit payment URL - user selects payment method on Xendit page
-          Alert.alert(
-            'Order Created',
-            `Order #${orderId} created successfully! Please complete payment in the browser.`,
-            [
-              {
-                text: 'Open Payment',
-                onPress: async () => {
-                  try {
-                    await Linking.openURL(paymentUrl);
-                    router.push('/(drawer)/marketplace');
-                  } catch (e) {
-                    console.error('Failed to open payment URL:', e);
-                    Alert.alert('Error', 'Failed to open payment page');
-                  }
-                }
-              },
-              {
-                text: 'Later',
-                onPress: () => router.push('/(drawer)/marketplace'),
-                style: 'cancel'
-              }
-            ]
-          );
-        } else {
-          // Fallback if no payment URL (shouldn't happen with Xendit)
-          Alert.alert(
-            'Order Placed',
-            `Order #${orderId} placed successfully!`,
-            [{ text: 'OK', onPress: () => router.push('/(drawer)/marketplace') }]
-          );
-        }
+      // Match web version response handling
+      const checkoutUrl = result?.data?.checkoutUrl || result?.checkoutUrl;
+      
+      if (!checkoutUrl) {
+        throw new Error('No checkout URL returned');
       }
+      
+      // Open Xendit payment page and navigate to orders
+      Alert.alert(
+        'Order Created',
+        'Order created successfully! Please complete payment in the browser.',
+        [
+          {
+            text: 'Open Payment',
+            onPress: async () => {
+              try {
+                await Linking.openURL(checkoutUrl);
+                router.push('/(drawer)/myOrders');
+              } catch (e) {
+                console.error('Failed to open payment URL:', e);
+                Alert.alert('Error', 'Failed to open payment page');
+              }
+            }
+          },
+          {
+            text: 'Later',
+            onPress: () => router.push('/(drawer)/myOrders'),
+            style: 'cancel'
+          }
+        ]
+      );
     } catch (error) {
       console.error('Error placing order:', error);
       Alert.alert('Error', error?.message || 'Failed to place order');
@@ -408,7 +521,21 @@ const OrderSummaryScreen = () => {
   if (loading && !refreshing) {
     return (
       <SafeAreaView style={styles.container}>
-        <Header title="Checkout" />
+        {/* Custom Header */}
+        <View style={[styles.header, { paddingTop: insets.top, height: insets.top + 56 }]}>
+          <View style={styles.headerLeft}>
+            <TouchableOpacity 
+              style={styles.backButton}
+              onPress={() => router.replace('/(drawer)/marketplace')}
+              hitSlop={{ top: 30, bottom: 30, left: 30, right: 30 }}
+              activeOpacity={0.6}
+            >
+              <Ionicons name="arrow-back" size={24} color="#333" />
+            </TouchableOpacity>
+            <Text style={styles.headerTitle}>Checkout</Text>
+          </View>
+        </View>
+        
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color="#A68C7B" />
           <Text style={styles.loadingText}>Loading...</Text>
@@ -419,7 +546,20 @@ const OrderSummaryScreen = () => {
 
   return (
     <SafeAreaView style={styles.container}>
-      <Header title="Checkout" />
+      {/* Custom Header */}
+      <View style={[styles.header, { paddingTop: insets.top, height: insets.top + 56 }] }>
+        <View style={styles.headerLeft}>
+          <TouchableOpacity 
+            style={styles.backButton}
+            onPress={() => router.replace('/(drawer)/marketplace')}
+            hitSlop={{ top: 30, bottom: 30, left: 30, right: 30 }}
+            activeOpacity={0.6}
+          >
+            <Ionicons name="arrow-back" size={24} color="#333" />
+          </TouchableOpacity>
+          <Text style={styles.headerTitle}>Checkout</Text>
+        </View>
+      </View>
       
       <ScrollView 
         style={styles.content} 
@@ -857,6 +997,7 @@ const OrderSummaryScreen = () => {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+    
     </SafeAreaView>
   );
 };
@@ -864,7 +1005,35 @@ const OrderSummaryScreen = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#F5F1EE',
+    backgroundColor: '#F5F8FA',
+  },
+  
+  // Custom Header Styles
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 14,
+    paddingBottom: 10,
+    backgroundColor: '#fff',
+    height: 60,
+  },
+  headerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  backButton: {
+    padding: 12,
+    minWidth: 56,
+    minHeight: 56,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: '#333',
+    marginLeft: 8,
   },
   loadingContainer: {
     flex: 1,
@@ -1092,7 +1261,6 @@ const styles = StyleSheet.create({
   footer: {
     backgroundColor: '#fff',
     padding: 16,
-    paddingBottom: 40,
     borderTopWidth: 1,
     borderTopColor: '#E8E0D8',
   },
