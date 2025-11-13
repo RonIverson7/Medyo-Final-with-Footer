@@ -34,15 +34,15 @@ const EventCard = ({ event, onPress }) => {
         <Image source={{ uri: event.image }} style={styles.eventImage} />
         {status === 'ended' ? (
           <View style={[styles.badge, styles.endedBadge]}>
-            <Text style={[styles.badgeText, styles.endedBadgeText]}>Ended</Text>
+            <Text numberOfLines={1} style={[styles.badgeText, styles.endedBadgeText]}>Ended</Text>
           </View>
         ) : status === 'live' ? (
           <View style={[styles.badge, styles.liveBadge]}>
-            <Text style={[styles.badgeText, styles.liveBadgeText]}>Live</Text>
+            <Text numberOfLines={1} style={[styles.badgeText, styles.liveBadgeText]}>Live</Text>
           </View>
         ) : (
           <View style={[styles.badge, styles.upcomingBadge]}>
-            <Text style={[styles.badgeText, styles.upcomingBadgeText]}>Upcoming</Text>
+            <Text numberOfLines={1} style={[styles.badgeText, styles.upcomingBadgeText]}>Upcoming</Text>
           </View>
         )}
       </View>
@@ -395,11 +395,16 @@ const styles = StyleSheet.create({
     borderColor: '#d4b48a',
     borderRadius: 8,
     paddingVertical: 4,
-    paddingHorizontal: 10,
+    paddingHorizontal: 14,
+    minWidth: 68,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   badgeText: {
     ...Typography.badge,
     color: Colors.textPrimary,
+    textAlign: 'center',
+    letterSpacing: 0,
   },
   liveBadge: {
     backgroundColor: 'rgba(76, 175, 80, 0.9)',
